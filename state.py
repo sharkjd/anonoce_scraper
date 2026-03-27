@@ -12,6 +12,11 @@ class ScraperState(TypedDict, total=False):
     max_pages: int
     concurrency: int
     request_delay_sec: float
+    min_page_delay_sec: float
+    max_page_delay_sec: float
+    min_detail_delay_sec: float
+    max_detail_delay_sec: float
+    detail_batch_size: int
     gemini_model: str
     navigation_wait_profiles: list[str]
     listing_navigation_retries: int
@@ -19,6 +24,7 @@ class ScraperState(TypedDict, total=False):
     listing_page_timeout_ms: int
     detail_page_timeout_ms: int
     navigation_timeout_step_ms: int
+    max_consecutive_empty_pages: int
     listing_items: list[ListingItem]
     company_classification: dict[str, str]
     raw_details: list[dict[str, Any]]

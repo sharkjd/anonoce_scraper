@@ -40,6 +40,21 @@ async def input_node(state: ScraperState) -> ScraperState:
         "request_delay_sec": float(
             state.get("request_delay_sec", float(os.getenv("REQUEST_DELAY_SEC", "0.8")))
         ),
+        "min_page_delay_sec": float(
+            state.get("min_page_delay_sec", float(os.getenv("MIN_PAGE_DELAY_SEC", "2.0")))
+        ),
+        "max_page_delay_sec": float(
+            state.get("max_page_delay_sec", float(os.getenv("MAX_PAGE_DELAY_SEC", "5.0")))
+        ),
+        "min_detail_delay_sec": float(
+            state.get("min_detail_delay_sec", float(os.getenv("MIN_DETAIL_DELAY_SEC", "2.0")))
+        ),
+        "max_detail_delay_sec": float(
+            state.get("max_detail_delay_sec", float(os.getenv("MAX_DETAIL_DELAY_SEC", "6.0")))
+        ),
+        "detail_batch_size": int(
+            state.get("detail_batch_size", int(os.getenv("DETAIL_BATCH_SIZE", "2")))
+        ),
         "gemini_model": str(state.get("gemini_model", os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))),
         "navigation_wait_profiles": navigation_wait_profiles,
         "listing_navigation_retries": int(
@@ -70,6 +85,12 @@ async def input_node(state: ScraperState) -> ScraperState:
             state.get(
                 "navigation_timeout_step_ms",
                 int(os.getenv("NAVIGATION_TIMEOUT_STEP_MS", "10000")),
+            )
+        ),
+        "max_consecutive_empty_pages": int(
+            state.get(
+                "max_consecutive_empty_pages",
+                int(os.getenv("MAX_CONSECUTIVE_EMPTY_PAGES", "3")),
             )
         ),
         "listing_items": [],

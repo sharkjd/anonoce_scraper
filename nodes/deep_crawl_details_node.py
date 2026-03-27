@@ -27,6 +27,9 @@ async def deep_crawl_details_node(state: ScraperState) -> ScraperState:
         detail_navigation_retries=state.get("detail_navigation_retries", 1),
         detail_page_timeout_ms=state.get("detail_page_timeout_ms", 70000),
         navigation_timeout_step_ms=state.get("navigation_timeout_step_ms", 10000),
+        min_detail_delay_sec=state.get("min_detail_delay_sec", 2.0),
+        max_detail_delay_sec=state.get("max_detail_delay_sec", 6.0),
+        batch_size=state.get("detail_batch_size", 2),
     )
     state["raw_details"] = details
     state["warnings"] = [*state.get("warnings", []), *warnings]

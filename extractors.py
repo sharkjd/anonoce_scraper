@@ -1,6 +1,8 @@
 import asyncio
+import gzip
 import json
-import random
+import os
+import zlib
 from typing import Any, Sequence
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -14,7 +16,43 @@ from crawl4ai import (
 )
 
 from annonce_listing import parse_anonce_listing_html
+from humanize import HUMAN_SCROLL_JS, browser_headers, human_delay, reading_pause
 from utils import ListingItem
+
+
+class AntiBlockDetected(Exception):
+    """Raised when server anti-bot protection is detected (CAPTCHA, block page)."""
+    pass
+
+
+def _get_anti_block_signatures() -> list[str]:
+    """Load anti-block detection signatures from environment."""
+    raw = os.getenv("ANTI_BLOCK_SIGNATURES", "")
+    if not raw.strip():
+        # Výchozí signatury pro annonce.cz
+        return [
+            "zamezení přístupu na server annonce.cz",
+            "nadměrná zátěž našeho serveru",
+            "opište kód z obrázku",
+            "captcha",
+        ]
+    return [s.strip().lower() for s in raw.split(",") if s.strip()]
+
+
+def _check_for_anti_block(html: str, url: str) -> None:
+    """Check if HTML contains anti-bot/CAPTCHA signatures and raise if found."""
+    if not html:
+        return
+    
+    signatures = _get_anti_block_signatures()
+    html_lower = html.lower()
+    
+    for signature in signatures:
+        if signature in html_lower:
+            raise AntiBlockDetected(
+                f"Anti-bot ochrana detekována na {url}: nalezen text '{signature}'. "
+                "Server zablokoval přístup kvůli příliš mnoha požadavkům."
+            )
 
 
 COOKIE_JS = """
@@ -145,27 +183,30 @@ async def _crawl_with_navigation_fallback(
     return None, {"ok": False, "attempts": attempts}
 
 
-async def _fetch_listing_html_http(url: str, timeout_ms: int) -> str:
+async def _fetch_listing_html_http(
+    url: str, timeout_ms: int, referer: str | None = None
+) -> str:
     """
     HTTP fallback for listing pages when browser navigation is blocked.
+    Uses randomised browser-like headers to reduce bot fingerprinting.
     """
     timeout_sec = max(timeout_ms / 1000.0, 10.0)
+    headers = browser_headers(url, referer)
 
     def _fetch_sync() -> str:
-        request = Request(
-            url=url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.8",
-            },
-        )
+        request = Request(url=url, headers=headers)
         with urlopen(request, timeout=timeout_sec) as response:  # noqa: S310
-            payload = response.read()
-        return payload.decode("utf-8", errors="replace")
+            raw = response.read()
+            encoding = response.headers.get("Content-Encoding", "")
+            if encoding == "gzip":
+                raw = gzip.decompress(raw)
+            elif encoding == "deflate":
+                # deflate may be raw zlib or bare deflate -- try both
+                try:
+                    raw = zlib.decompress(raw)
+                except zlib.error:
+                    raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+        return raw.decode("utf-8", errors="replace")
 
     try:
         return await asyncio.to_thread(_fetch_sync)
@@ -220,10 +261,15 @@ async def discover_anonce_listings(
     listing_navigation_retries: int,
     listing_page_timeout_ms: int,
     navigation_timeout_step_ms: int,
+    max_consecutive_empty_pages: int = 3,
+    min_page_delay_sec: float = 2.0,
+    max_page_delay_sec: float = 5.0,
 ) -> tuple[list[ListingItem], list[str]]:
     """Fetch Annonce category listing pages and parse HTML (no LLM on listing)."""
     listings: list[ListingItem] = []
     warnings: list[str] = []
+    prev_url: str | None = None
+    empty_pages_streak = 0
 
     config_kwargs = {
         "cache_mode": CacheMode.BYPASS,
@@ -233,9 +279,20 @@ async def discover_anonce_listings(
     async with AsyncWebCrawler() as crawler:
         for page in range(1, max_pages + 1):
             page_url = _build_listing_url(base_url, page)
+            print(
+                f"[Scraper] Annonce.cz: zpracovávám stránku {page}/{max_pages} ({page_url})",
+                flush=True,
+            )
             try:
                 # Listing pages are mostly static HTML, so try direct HTTP first.
-                html = await _fetch_listing_html_http(page_url, listing_page_timeout_ms)
+                html = await _fetch_listing_html_http(
+                    page_url, listing_page_timeout_ms, referer=prev_url
+                )
+                
+                # Kontrola anti-bot ochrany v HTML
+                if html.strip():
+                    _check_for_anti_block(html, page_url)
+                
                 if not html.strip():
                     result, nav_meta = await _crawl_with_navigation_fallback(
                         crawler=crawler,
@@ -265,19 +322,54 @@ async def discover_anonce_listings(
                             f"{nav_meta.get('chosen_timeout_ms')} ms)."
                         )
                     html = _crawl_result_html(result)
+                    
+                    # Kontrola anti-bot ochrany i pro browser fallback
+                    if html.strip():
+                        _check_for_anti_block(html, page_url)
 
                 page_items = parse_anonce_listing_html(html, page_url)
                 if not page_items and page > 1:
-                    warnings.append(f"anonce: no listings on page {page}, stopping pagination.")
-                    break
+                    empty_pages_streak += 1
+                    warnings.append(
+                        "anonce: no listings on page "
+                        f"{page} (empty streak {empty_pages_streak}/"
+                        f"{max(max_consecutive_empty_pages, 1)})."
+                    )
+                    if empty_pages_streak >= max(max_consecutive_empty_pages, 1):
+                        warnings.append(
+                            "anonce: stopping pagination after "
+                            f"{empty_pages_streak} consecutive empty pages."
+                        )
+                        break
+                    prev_url = page_url
+                    continue
                 if not page_items and page == 1:
                     warnings.append(
                         "anonce: page 1 returned no parseable listings (empty HTML or layout change?)."
                     )
+                if page_items:
+                    empty_pages_streak = 0
+                    print(
+                        f"[Scraper] Annonce.cz: stránka {page} -> {len(page_items)} inzerátů.",
+                        flush=True,
+                    )
                 listings.extend(page_items)
+                prev_url = page_url
+            except AntiBlockDetected as e:
+                error_msg = str(e)
+                warnings.append(f"ANTI-BOT BLOKACE: {error_msg}")
+                print(
+                    f"\n[Scraper] ⚠️  ANTI-BOT OCHRANA DETEKOVÁNA!\n"
+                    f"[Scraper] {error_msg}\n"
+                    f"[Scraper] Scraping zastaven na stránce {page}. "
+                    f"Nalezeno {len(listings)} inzerátů před blokací.\n"
+                    f"[Scraper] Doporučení: počkejte alespoň 15 minut před dalším spuštěním.\n",
+                    flush=True,
+                )
+                break
             except Exception as exc:  # pragma: no cover - runtime dependent
                 warnings.append(f"anonce: listing crawl failed on page {page}: {exc}")
-            await asyncio.sleep(max(request_delay_sec, 0.0))
+            await human_delay(min_page_delay_sec, max_page_delay_sec)
 
     return listings, warnings
 
@@ -294,16 +386,18 @@ async def extract_job_detail(
     detail_navigation_retries: int = 1,
     detail_page_timeout_ms: int = 70000,
     navigation_timeout_step_ms: int = 10000,
+    min_detail_delay_sec: float = 2.0,
+    max_detail_delay_sec: float = 6.0,
 ) -> tuple[dict[str, Any] | None, str | None]:
     strategy = _detail_extraction_strategy(gemini_model)
     config_kwargs = {
         "extraction_strategy": strategy,
         "cache_mode": CacheMode.BYPASS,
-        "js_code": COOKIE_JS,
+        "js_code": [COOKIE_JS, HUMAN_SCROLL_JS],
     }
 
     async with semaphore:
-        await asyncio.sleep(max(request_delay_sec + random.uniform(0.0, 0.35), 0.0))
+        await human_delay(min_detail_delay_sec, max_detail_delay_sec)
         result, nav_meta = await _crawl_with_navigation_fallback(
             crawler=crawler,
             url=listing.detail_url,
@@ -324,6 +418,12 @@ async def extract_job_detail(
                 f"timeout_ms={last_attempt.get('timeout_ms', 'n/a')}, "
                 f"error={last_attempt.get('error', 'unknown error')}",
             )
+
+        # Kontrola anti-bot ochrany v HTML odpovědi
+        html_content = _crawl_result_html(result)
+        _check_for_anti_block(html_content, listing.detail_url)
+
+        await reading_pause(1.5, 4.0)
 
         payload = _parse_extracted_json(result.extracted_content) or {}
         if isinstance(payload, list):
@@ -353,33 +453,82 @@ async def deep_crawl_details(
     detail_navigation_retries: int = 1,
     detail_page_timeout_ms: int = 70000,
     navigation_timeout_step_ms: int = 10000,
+    min_detail_delay_sec: float = 2.0,
+    max_detail_delay_sec: float = 6.0,
+    batch_size: int = 2,
 ) -> tuple[list[dict[str, Any]], list[str]]:
+    import random
+    
     semaphore = asyncio.Semaphore(max(concurrency, 1))
+    details: list[dict[str, Any]] = []
     warnings: list[str] = []
+    processed_count = 0
+    anti_block_hit = False
+    
+    # Každých N inzerátů uděláme delší pauzu (simulace "člověk si dal kafe")
+    long_pause_interval = random.randint(8, 15)
+    long_pause_min = 20.0
+    long_pause_max = 45.0
 
     async with AsyncWebCrawler() as crawler:
-        tasks = [
-            extract_job_detail(
-                crawler=crawler,
-                listing=listing,
-                listing_url=listing_url,
-                agency_status=company_classification.get(listing.company, "uncertain"),
-                gemini_model=gemini_model,
-                request_delay_sec=request_delay_sec,
-                semaphore=semaphore,
-                navigation_wait_profiles=navigation_wait_profiles,
-                detail_navigation_retries=detail_navigation_retries,
-                detail_page_timeout_ms=detail_page_timeout_ms,
-                navigation_timeout_step_ms=navigation_timeout_step_ms,
-            )
-            for listing in listings
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
+        for batch_start in range(0, len(listings), batch_size):
+            if anti_block_hit:
+                break
+                
+            batch = listings[batch_start : batch_start + batch_size]
+            
+            # Zpracováváme jeden po jednom kvůli lepší detekci blokace
+            for listing in batch:
+                if anti_block_hit:
+                    break
+                try:
+                    payload, warning = await extract_job_detail(
+                        crawler=crawler,
+                        listing=listing,
+                        listing_url=listing_url,
+                        agency_status=company_classification.get(listing.company, "uncertain"),
+                        gemini_model=gemini_model,
+                        request_delay_sec=request_delay_sec,
+                        semaphore=semaphore,
+                        navigation_wait_profiles=navigation_wait_profiles,
+                        detail_navigation_retries=detail_navigation_retries,
+                        detail_page_timeout_ms=detail_page_timeout_ms,
+                        navigation_timeout_step_ms=navigation_timeout_step_ms,
+                        min_detail_delay_sec=min_detail_delay_sec,
+                        max_detail_delay_sec=max_detail_delay_sec,
+                    )
+                    if payload:
+                        details.append(payload)
+                    if warning:
+                        warnings.append(warning)
+                    processed_count += 1
+                    
+                except AntiBlockDetected as e:
+                    anti_block_hit = True
+                    error_msg = str(e)
+                    warnings.append(f"ANTI-BOT BLOKACE: {error_msg}")
+                    print(
+                        f"\n[Scraper] ⚠️  ANTI-BOT OCHRANA DETEKOVÁNA!\n"
+                        f"[Scraper] {error_msg}\n"
+                        f"[Scraper] Scraping zastaven. Zpracováno {len(details)} z {len(listings)} inzerátů.\n"
+                        f"[Scraper] Doporučení: počkejte alespoň 15 minut před dalším spuštěním.\n",
+                        flush=True,
+                    )
+                    break
+            
+            if not anti_block_hit and batch_start + batch_size < len(listings):
+                # Každých N inzerátů uděláme delší pauzu
+                if processed_count >= long_pause_interval:
+                    pause_duration = await human_delay(long_pause_min, long_pause_max)
+                    print(
+                        f"[Scraper] Anti-bot pauza: {pause_duration:.1f}s "
+                        f"(po {processed_count} inzerátech)",
+                        flush=True,
+                    )
+                    processed_count = 0
+                    long_pause_interval = random.randint(8, 15)
+                else:
+                    # Standardní pauza mezi batchy (ale delší než dříve)
+                    await human_delay(min_detail_delay_sec * 0.5, max_detail_delay_sec * 0.5)
 
-    details: list[dict[str, Any]] = []
-    for payload, warning in results:
-        if payload:
-            details.append(payload)
-        if warning:
-            warnings.append(warning)
     return details, warnings

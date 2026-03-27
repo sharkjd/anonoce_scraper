@@ -29,3 +29,5 @@ if __name__ == "__main__":
     print(f"CSV output: {result_state.get('output_csv_path')}")
     if result_state.get("warnings"):
         print(f"Warnings: {len(result_state['warnings'])}")
+        for warning in result_state["warnings"]:
+            print(f" - {warning}")
