@@ -1,6 +1,7 @@
 import os
 
 from .console_prompts import prompt_max_pages
+from run_report import append_kv, append_line, append_section
 from state import DEFAULT_ANNONCE_LISTING_URL, ScraperState
 
 
@@ -32,6 +33,30 @@ async def input_node(state: ScraperState) -> ScraperState:
         f"listing_url={listing_base}",
         flush=True,
     )
+
+    append_section("Konfigurace běhu (vstupní uzel)")
+    append_kv("listing_base_url", listing_base)
+    append_kv("max_pages", max_pages)
+    append_kv("concurrency", concurrency)
+    append_kv("output_csv_path", state.get("output_csv_path", default_csv))
+    append_kv("request_delay_sec", float(state.get("request_delay_sec", float(os.getenv("REQUEST_DELAY_SEC", "0.8")))))
+    append_kv("min_page_delay_sec", float(state.get("min_page_delay_sec", float(os.getenv("MIN_PAGE_DELAY_SEC", "2.0")))))
+    append_kv("max_page_delay_sec", float(state.get("max_page_delay_sec", float(os.getenv("MAX_PAGE_DELAY_SEC", "5.0")))))
+    append_kv("min_detail_delay_sec", float(state.get("min_detail_delay_sec", float(os.getenv("MIN_DETAIL_DELAY_SEC", "2.0")))))
+    append_kv("max_detail_delay_sec", float(state.get("max_detail_delay_sec", float(os.getenv("MAX_DETAIL_DELAY_SEC", "6.0")))))
+    append_kv("detail_batch_size", int(state.get("detail_batch_size", int(os.getenv("DETAIL_BATCH_SIZE", "2")))))
+    append_kv("gemini_model", str(state.get("gemini_model", os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))))
+    append_kv("navigation_wait_profiles", ",".join(navigation_wait_profiles))
+    append_kv("listing_navigation_retries", int(state.get("listing_navigation_retries", int(os.getenv("LISTING_NAVIGATION_RETRIES", "1")))))
+    append_kv("detail_navigation_retries", int(state.get("detail_navigation_retries", int(os.getenv("DETAIL_NAVIGATION_RETRIES", "1")))))
+    append_kv("listing_page_timeout_ms", int(state.get("listing_page_timeout_ms", int(os.getenv("LISTING_PAGE_TIMEOUT_MS", "60000")))))
+    append_kv("detail_page_timeout_ms", int(state.get("detail_page_timeout_ms", int(os.getenv("DETAIL_PAGE_TIMEOUT_MS", "70000")))))
+    append_kv("navigation_timeout_step_ms", int(state.get("navigation_timeout_step_ms", int(os.getenv("NAVIGATION_TIMEOUT_STEP_MS", "10000")))))
+    append_kv("max_consecutive_empty_pages", int(state.get("max_consecutive_empty_pages", int(os.getenv("MAX_CONSECUTIVE_EMPTY_PAGES", "3")))))
+    run_log = state.get("run_log_path")
+    if run_log:
+        append_kv("run_log_path", run_log)
+    append_line()
 
     return {
         "listing_base_url": listing_base,

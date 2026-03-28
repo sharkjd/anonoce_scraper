@@ -1,0 +1,9 @@
+# Příkazy pro macOS / zsh. API klíče v .env.
+# Poprvé (bez .venv): python3 -m venv .venv
+# Pak jednou: pip install -r requirements.txt (s aktivovaným venv)
+#
+# Zkopíruj do terminálu jen tři řádky pod tímto komentářem (nebo celý soubor — komentáře se přeskočí):
+
+cd "/Users/jandolejs/Desktop/Vibe Coding/Workia folder/anonce a jobscs searcher"
+source .venv/bin/activate
+python main.py

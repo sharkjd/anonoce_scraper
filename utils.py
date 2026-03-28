@@ -6,6 +6,8 @@ import re
 from pathlib import Path
 from typing import Literal
 
+AgencyDecisionSource = Literal["known_agencies", "gemini", "error", "serper"]
+
 import google.generativeai as genai
 from langsmith import traceable
 from pydantic import BaseModel, Field, ValidationError
@@ -50,6 +52,7 @@ class JobDetail(BaseModel):
     company: str = ""
     position: str = ""
     short_description: str = ""
+    # At most one entry: canonical job role from JOB_ROLE_LABELS, or „Jiné“ (see job_role_labels.py).
     keywords: list[str] = Field(default_factory=list)
     email: str = ""
     phone: str = ""
@@ -60,6 +63,8 @@ class JobDetail(BaseModel):
 class AgencyDecision(BaseModel):
     status: AgencyStatus
     reason: str = ""
+    # known_agencies = heuristický seznam; gemini = LLM; error = chybí klíč / výjimka; serper = rezervováno
+    source: AgencyDecisionSource = "gemini"
 
 
 _BLUE_COLLAR_ALLOWED: dict[str, BlueCollarLabel] = {
@@ -87,90 +92,22 @@ def _extract_json_from_response(text: str) -> dict:
     return json.loads(cleaned)
 
 
-def _normalize_blue_collar_response(raw_text: str) -> BlueCollarLabel | None:
-    cleaned = (raw_text or "").strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:text|markdown)?", "", cleaned).strip()
-        cleaned = re.sub(r"```$", "", cleaned).strip()
-    cleaned = cleaned.strip().strip('"').strip("'")
-    normalized = re.sub(r"\s+", " ", cleaned).strip().lower()
-    return _BLUE_COLLAR_ALLOWED.get(normalized)
-
-
-def _build_blue_collar_prompt(position: str, short_description: str, keywords: list[str], company: str) -> str:
-    # Strict prompt so the model returns only one of two exact labels.
-    return f"""
-You are a strict job classifier.
-
-Decide if the role is blue-collar (manual/trade/manufacturing/operations), for example:
-bricklayer, locksmith, driver, CNC operator, factory worker, warehouse/manual labor.
-
-Return exactly one value and nothing else:
-Blue collars
-Vyřazeno
-
-Rules:
-- Return "Blue collars" only when the role is clearly blue-collar.
-- Return "Vyřazeno" for office/admin/management/IT/sales/HR/finance/legal/marketing and all unclear cases.
-- Do not output markdown, punctuation, JSON, explanation, or extra text.
-
-Input:
-Position: {position or "N/A"}
-Company: {company or "N/A"}
-Description: {short_description or "N/A"}
-Keywords: {", ".join(keywords or []) or "N/A"}
-""".strip()
-
-
-def _gemini_blue_collar_sync(
-    *,
-    position: str,
-    short_description: str,
-    keywords: list[str],
-    company: str,
-    gemini_model: str = "gemini-2.5-flash",
-) -> tuple[BlueCollarLabel, str | None]:
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return "Vyřazeno", "Missing GEMINI_API_KEY, blue-collar classification defaulted to Vyřazeno."
-
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(gemini_model)
-    prompt = _build_blue_collar_prompt(position, short_description, keywords, company)
-
-    try:
-        response = model.generate_content(prompt)
-    except Exception as exc:  # pragma: no cover - network/runtime dependent
-        return "Vyřazeno", f"Blue-collar Gemini error: {exc}"
-
-    label = _normalize_blue_collar_response(getattr(response, "text", ""))
-    if label is None:
-        raw_preview = (getattr(response, "text", "") or "").strip().replace("\n", " ")
-        raw_preview = raw_preview[:120] if raw_preview else "<empty>"
-        return "Vyřazeno", (
-            "Blue-collar classification returned unexpected value, defaulted to Vyřazeno: "
-            f"{raw_preview}"
-        )
-    return label, None
-
-
-@traceable(name="classify_blue_collar_job", run_type="chain")
-async def classify_blue_collar_job(
-    *,
-    position: str,
-    short_description: str,
-    keywords: list[str],
-    company: str,
-    gemini_model: str = "gemini-2.5-flash",
-) -> tuple[BlueCollarLabel, str | None]:
-    return await asyncio.to_thread(
-        _gemini_blue_collar_sync,
-        position=position,
-        short_description=short_description,
-        keywords=keywords,
-        company=company,
-        gemini_model=gemini_model,
-    )
+def normalize_blue_collar_label_value(raw: object) -> BlueCollarLabel:
+    """
+    Coerce LLM / JSON extraction output to a valid blue-collar label.
+    Unknown or missing values default to "Vyřazeno".
+    """
+    if raw is None:
+        return "Vyřazeno"
+    text = str(raw).strip()
+    if not text:
+        return "Vyřazeno"
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:text|markdown|json)?", "", text).strip()
+        text = re.sub(r"```$", "", text).strip()
+    text = text.strip().strip('"').strip("'")
+    normalized = re.sub(r"\s+", " ", text).strip().lower()
+    return _BLUE_COLLAR_ALLOWED.get(normalized, "Vyřazeno")
 
 
 def _gemini_classify_sync(company_name: str, hint_text: str, gemini_model: str) -> AgencyDecision:
@@ -179,6 +116,7 @@ def _gemini_classify_sync(company_name: str, hint_text: str, gemini_model: str) 
         return AgencyDecision(
             status="uncertain",
             reason="Missing GEMINI_API_KEY, classification skipped.",
+            source="error",
         )
 
     genai.configure(api_key=api_key)
@@ -205,15 +143,30 @@ Context snippet: {hint_text or "N/A"}
     try:
         response = model.generate_content(prompt)
         payload = _extract_json_from_response(getattr(response, "text", ""))
-        return AgencyDecision(**payload)
+        raw_status = payload.get("status", "uncertain")
+        if raw_status not in ("agency", "direct_employer", "uncertain"):
+            raw_status = "uncertain"
+        return AgencyDecision(
+            status=raw_status,
+            reason=str(payload.get("reason", "")),
+            source="gemini",
+        )
     except Exception as exc:  # pragma: no cover - network/runtime dependent
-        return AgencyDecision(status="uncertain", reason=f"Gemini error: {exc}")
+        return AgencyDecision(
+            status="uncertain",
+            reason=f"Gemini error: {exc}",
+            source="error",
+        )
 
 
 @traceable(name="classify_company", run_type="chain")
 async def classify_company(company_name: str, hint_text: str, gemini_model: str) -> AgencyDecision:
     if is_known_agency(company_name):
-        return AgencyDecision(status="agency", reason="Matched known agency list.")
+        return AgencyDecision(
+            status="agency",
+            reason="Matched known agency list.",
+            source="known_agencies",
+        )
     return await asyncio.to_thread(_gemini_classify_sync, company_name, hint_text, gemini_model)
 
 

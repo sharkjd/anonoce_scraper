@@ -1,4 +1,7 @@
+import json
+
 from extractors import discover_anonce_listings
+from run_report import append_line, append_section
 from state import ScraperState
 
 
@@ -8,7 +11,7 @@ async def discover_anonce_node(state: ScraperState) -> ScraperState:
         f"delay {state['request_delay_sec']} s) …",
         flush=True,
     )
-    listings, warnings = await discover_anonce_listings(
+    listings, warnings, page_reports = await discover_anonce_listings(
         base_url=state["listing_base_url"],
         max_pages=state["max_pages"],
         request_delay_sec=state["request_delay_sec"],
@@ -29,4 +32,10 @@ async def discover_anonce_node(state: ScraperState) -> ScraperState:
     if warnings:
         for warning in warnings:
             print(f"[Warning] {warning}", flush=True)
+
+    append_section("Discover — výpisové stránky Annonce")
+    append_line(f"Celkem nalezených inzerátů (před deduplikací): {len(listings)}")
+    append_line(f"Počet zpracovaných stránek výpisu (report záznamů): {len(page_reports)}")
+    for pr in page_reports:
+        append_line(json.dumps(pr, ensure_ascii=False))
     return state

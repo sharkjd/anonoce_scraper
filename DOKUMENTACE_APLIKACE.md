@@ -12,7 +12,7 @@ Tento dokument popisuje architekturu, datové toky, konfiguraci a výstupní for
 - **Deduplikuje** odkazy na detail.
 - U každé unikátní firmy z výpisu rozhodne, zda jde o **personální agenturu** nebo přímého zaměstnavatele (heuristika + LLM). Inzeráty označené jako agentura se **nestahují** na detail.
 - U zbývajících inzerátů **stáhne detail stránku**, z HTML extrahuje strukturovaná data pomocí **LLM** (crawl4ai + Gemini).
-- Výsledky **validuje** (Pydantic), přiřadí štítek **blue collar** vs. **Vyřazeno** (další volání Gemini).
+- Výsledky **validuje** (Pydantic); štítek **blue collar** vs. **Vyřazeno** přichází už z **téže** LLM extrakce detailu (jedno volání na stránku).
 - Zapíše výsledek do **CSV** souboru.
 
 **Hlavní technologie**
@@ -21,7 +21,7 @@ Tento dokument popisuje architekturu, datové toky, konfiguraci a výstupní for
 |--------|-------------------|
 | Orchestrace kroků | LangGraph (`StateGraph`) |
 | Prohlížečové stahování + LLM extrakce z HTML | crawl4ai (`AsyncWebCrawler`, `LLMExtractionStrategy`) |
-| Klasifikace firem a blue-collar | Google Generative AI (`google-generativeai`) |
+| Klasifikace firem (agentura) | Google Generative AI (`google-generativeai`) |
 | Modely dat | Pydantic |
 | Volitelné trasování běhu | LangSmith (`langsmith_setup.py`) |
 
@@ -57,15 +57,13 @@ Většina parametrů se načítá v uzlu `nodes/input_node.py` z prostředí neb
 | `MIN_DETAIL_DELAY_SEC` / `MAX_DETAIL_DELAY_SEC` | Náhodná pauza u detailů | `2.0` / `6.0` |
 | `DETAIL_BATCH_SIZE` | Velikost „dávky“ před delší pauzou v detailním crawlu | `2` |
 | `GEMINI_API_KEY` | API klíč pro Gemini (extrakce + klasifikace) | *povinné pro plnou funkci* |
-| `GEMINI_MODEL` | Model pro extrakci z detailu a klasifikaci agentur | `gemini-1.5-flash` |
+| `GEMINI_MODEL` | Model pro LLM extrakci z detailu (včetně `blue_collar_label`) a klasifikaci agentur | `gemini-1.5-flash` |
 | `NAVIGATION_WAIT_PROFILES` | Čárkou oddělené `wait_until` režimy pro Playwright | `networkidle,domcontentloaded,load` |
 | `LISTING_NAVIGATION_RETRIES` / `DETAIL_NAVIGATION_RETRIES` | Retry na profil navigace | `1` |
 | `LISTING_PAGE_TIMEOUT_MS` / `DETAIL_PAGE_TIMEOUT_MS` | Timeout načtení stránky | `60000` / `70000` |
 | `NAVIGATION_TIMEOUT_STEP_MS` | Krok navyšování timeoutu při opakování | `10000` |
 | `MAX_CONSECUTIVE_EMPTY_PAGES` | Po tolika prázdných stránkách za sebou se výpis ukončí | `3` |
 | `ANTI_BLOCK_SIGNATURES` | Vlastní čárkou oddělené podřetězce pro detekci blokace (lowercase) | výchozí české fráze v `extractors.py` |
-
-**Blue-collar uzel** (`nodes/blue_collar_classification_node.py`) volá model **`gemini-2.5-flash` natvrdo** — nejde o `GEMINI_MODEL` z env.
 
 ### 3.2 LangSmith (volitelné)
 
@@ -103,9 +101,8 @@ flowchart LR
   agency[agency_classification_node]
   deep[deep_crawl_details_node]
   validate[validate_and_normalize_node]
-  blue[blue_collar_classification_node]
   export[export_csv_node]
-  input --> discover --> dedupe --> agency --> deep --> validate --> blue --> export
+  input --> discover --> dedupe --> agency --> deep --> validate --> export
 ```
 
 Sestavení grafu: `graph_builder.py` — lineární řetězec uzlů, poslední hrana na `END`.
@@ -118,8 +115,7 @@ Sestavení grafu: `graph_builder.py` — lineární řetězec uzlů, poslední h
 | 4 | `agency_classification_node` | `nodes/agency_classification_node.py` | `company_classification`: `agency` / `direct_employer` / `uncertain` |
 | 5 | `deep_crawl_details_node` | `nodes/deep_crawl_details_node.py` | Crawl detailů jen pro firmy ≠ `agency` → `raw_details` |
 | 6 | `validate_and_normalize_node` | `nodes/validate_node.py` | Dict → `JobDetail` → `valid_details` |
-| 7 | `blue_collar_classification_node` | `nodes/blue_collar_classification_node.py` | Doplní `blue_collar_label` na každém záznamu |
-| 8 | `export_csv_node` | `nodes/export_csv_node.py` | Zapíše CSV, aktualizuje `output_csv_path` |
+| 7 | `export_csv_node` | `nodes/export_csv_node.py` | Zapíše CSV, aktualizuje `output_csv_path` |
 
 ---
 
@@ -139,7 +135,7 @@ Používá se pro položky z **výpisu**.
 
 ### 5.2 `JobDetail` (`utils.py`)
 
-Výsledek po extrakci z detailu + validaci + klasifikace.
+Výsledek po extrakci z detailu (včetně `blue_collar_label`) a validaci.
 
 | Pole | Poznámka |
 |------|----------|
@@ -148,10 +144,10 @@ Výsledek po extrakci z detailu + validaci + klasifikace.
 | `detail_url` | Odkaz na inzerát |
 | `ad_date` | Z propagace z `ListingItem` |
 | `city`, `company`, `position`, `short_description` | Z LLM extrakce / fallback |
-| `keywords` | Seznam řetězců |
+| `keywords` | Nejvýše jeden řetězec: role vybraná LLM z pevného číselníku `JOB_ROLE_LABELS` v `job_role_labels.py` včetně hodnoty „Jiné“ pro nezařaditelné inzeráty; při neplatném výstupu LLM se doplní „Jiné“ (sloupec CSV „Klíčová slova“) |
 | `email`, `phone` | Kontakty z extrakce |
 | `agency_status` | Stav z klasifikace firmy u tohoto inzerátu |
-| `blue_collar_label` | `Blue collars` nebo `Vyřazeno` |
+| `blue_collar_label` | `Blue collars` nebo `Vyřazeno` (z detailní LLM extrakce; neplatná hodnota se v kódu normalizuje na `Vyřazeno`) |
 
 ### 5.3 Tok mezi uzly (zjednodušeně)
 
@@ -161,7 +157,7 @@ Výsledek po extrakci z detailu + validaci + klasifikace.
 4. **Detaily:** filtrování `listing_items` kde `company_classification[company] != "agency"`
 5. **Raw:** seznam slovníků z crawl4ai + doplněná metadata
 6. **Validní:** Pydantic `JobDetail` (nevalidní řádky → varování, vynechány z `valid_details`)
-7. **Export:** jen `valid_details` → CSV
+7. **Export:** `valid_details` → CSV (`blue_collar_label` už je v datech z kroku detailu)
 
 ---
 
@@ -179,9 +175,9 @@ Výsledek po extrakci z detailu + validaci + klasifikace.
 ### 6.2 Detail (`extractors.extract_job_detail` + `deep_crawl_details`)
 
 - Jeden sdílený `AsyncWebCrawler`, semaphore podle `concurrency`.
-- `LLMExtractionStrategy` s JSON schema (povinné pole `position`; ostatní skaláry volitelné, `keywords` pole).
+- `LLMExtractionStrategy` s JSON schema (povinná pole `position`, `blue_collar_label` a `job_role_label`; ostatní skaláry volitelné; `job_role_label` je enum rolí z `job_role_labels.py` (32 konkrétních rolí + „Jiné“), po parsování se mapuje do `keywords`; při neznámé hodnotě se použije „Jiné“ a zapíše se varování; `blue_collar_label` je enum `Blue collars` / `Vyřazeno`).
 - Před/po načtení: JS souhlas s cookies (`COOKIE_JS`), scroll (`HUMAN_SCROLL_JS`), `reading_pause`.
-- Výstup LLM se parsuje z `result.extracted_content`, sloučí s `listing_url`, `detail_url`, `ad_date`, `agency_status`, doplnění `position` z `listing.title` pokud chybí.
+- Výstup LLM se parsuje z `result.extracted_content`, sloučí s `listing_url`, `detail_url`, `ad_date`, `agency_status`, doplnění `position` z `listing.title` pokud chybí; `job_role_label` se přes `job_role_labels.normalize_job_role_label` promítne do `keywords` (klíč `job_role_label` se z payloadu odstraní); při neplatné nebo chybějící hodnotě se do `keywords` zapíše „Jiné“ (`JOB_ROLE_OTHER`) a varování; `blue_collar_label` se přes `utils.normalize_blue_collar_label_value` sjednotí na platný štítek.
 - `deep_crawl_details` zpracovává inzeráty v dávkách (`detail_batch_size`), mezi dávkami pauzy; po náhodném počtu zpracovaných inzerátů delší pauza (omezení zátěže).
 - Při `AntiBlockDetected` na detailu se ukončí zpracování zbývajících inzerátů.
 
@@ -190,10 +186,10 @@ Výsledek po extrakci z detailu + validaci + klasifikace.
 - Pokud normalizovaný název obsahuje některý z `KNOWN_AGENCIES` → okamžitě `agency`.
 - Jinak synchronní volání Gemini s požadavkem na JSON: `status`, `reason`.
 
-### 6.4 Blue collar (`utils.classify_blue_collar_job`)
+### 6.4 Blue collar (součást detail extrakce)
 
-- Prompt v angličtině, odpověď musí být přesně `Blue collars` nebo `Vyřazeno`.
-- Voláno asynchronně přes `asyncio.to_thread` z uzlu s limitem paralelity `concurrency`.
+- Pravidla klasifikace jsou v anglické instrukci uvnitř `_detail_extraction_strategy` v `extractors.py` (stejná logika jako dříve samostatný prompt).
+- Po parsování JSON se hodnota projde `utils.normalize_blue_collar_label_value` — neznámý výstup se mapuje na `Vyřazeno`.
 
 ---
 
@@ -212,7 +208,7 @@ Výsledek po extrakci z detailu + validaci + klasifikace.
 | `Kategorie` | `blue_collar_label` (`Blue collars` / `Vyřazeno`) |
 | `Popis` | `short_description` |
 | `Město` | `city` |
-| `Klíčová slova` | `keywords` spojené čárkou a mezerou |
+| `Klíčová slova` | Jedna role z číselníku (uloženo v `keywords` jako jednoprvkový seznam; export spojuje čárkou, typicky jedna hodnota) |
 | `Telefon` | `phone` |
 | `Odkaz` | `detail_url` |
 

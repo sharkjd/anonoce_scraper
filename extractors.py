@@ -17,7 +17,8 @@ from crawl4ai import (
 
 from annonce_listing import parse_anonce_listing_html
 from humanize import HUMAN_SCROLL_JS, browser_headers, human_delay, reading_pause
-from utils import ListingItem
+from job_role_labels import JOB_ROLE_LABELS, JOB_ROLE_OTHER, normalize_job_role_label
+from utils import ListingItem, normalize_blue_collar_label_value
 
 
 class AntiBlockDetected(Exception):
@@ -228,16 +229,34 @@ def _detail_extraction_strategy(gemini_model: str) -> LLMExtractionStrategy:
                 "company": {"type": "string"},
                 "position": {"type": "string"},
                 "short_description": {"type": "string"},
-                "keywords": {"type": "array", "items": {"type": "string"}},
+                "job_role_label": {
+                    "type": "string",
+                    "enum": list(JOB_ROLE_LABELS),
+                },
                 "email": {"type": "string"},
                 "phone": {"type": "string"},
+                "blue_collar_label": {
+                    "type": "string",
+                    "enum": ["Blue collars", "Vyřazeno"],
+                },
             },
-            "required": ["position"],
+            "required": ["position", "blue_collar_label", "job_role_label"],
         },
         instruction=(
-            "Extract Czech job detail information. "
-            "Fields: city, company, position, short_description, keywords, email, phone. "
-            "Use an empty string for missing scalar fields and empty list for keywords."
+            "Extract Czech job detail information from the page. "
+            "Scalar fields: city, company, position, short_description, email, phone. "
+            "Use an empty string when a scalar field is missing.\n\n"
+            "job_role_label: choose exactly ONE value from the allowed enum that best matches the job "
+            "(title, description, and body text on the page). "
+            "Prefer the most specific label when several fit (e.g. CNC programátor over Operátor výroby "
+            "when programming is central). "
+            "Use \"Jiné\" when none of the other labels is a reasonable match. "
+            "You must not invent labels; only enum values are valid.\n\n"
+            "blue_collar_label: exactly one of \"Blue collars\" or \"Vyřazeno\". "
+            "Blue-collar means manual/trade/manufacturing/operations roles "
+            "(e.g. bricklayer, locksmith, driver, CNC operator, factory worker, warehouse/manual labor). "
+            "Use \"Blue collars\" only when the role is clearly blue-collar. "
+            "Use \"Vyřazeno\" for office/admin/management/IT/sales/HR/finance/legal/marketing and all unclear cases."
         ),
     )
 
@@ -253,6 +272,19 @@ def _parse_extracted_json(raw_payload: str) -> Any:
     return json.loads(text)
 
 
+def _browser_nav_summary(nav_meta: dict[str, Any]) -> dict[str, Any]:
+    attempts = nav_meta.get("attempts") or []
+    tail = attempts[-5:] if len(attempts) > 5 else attempts
+    return {
+        "ok": nav_meta.get("ok"),
+        "chosen_mode": nav_meta.get("chosen_mode"),
+        "chosen_retry": nav_meta.get("chosen_retry"),
+        "chosen_timeout_ms": nav_meta.get("chosen_timeout_ms"),
+        "attempts_total": len(attempts),
+        "last_attempts": tail,
+    }
+
+
 async def discover_anonce_listings(
     base_url: str,
     max_pages: int,
@@ -264,10 +296,11 @@ async def discover_anonce_listings(
     max_consecutive_empty_pages: int = 3,
     min_page_delay_sec: float = 2.0,
     max_page_delay_sec: float = 5.0,
-) -> tuple[list[ListingItem], list[str]]:
+) -> tuple[list[ListingItem], list[str], list[dict[str, Any]]]:
     """Fetch Annonce category listing pages and parse HTML (no LLM on listing)."""
     listings: list[ListingItem] = []
     warnings: list[str] = []
+    page_reports: list[dict[str, Any]] = []
     prev_url: str | None = None
     empty_pages_streak = 0
 
@@ -283,17 +316,31 @@ async def discover_anonce_listings(
                 f"[Scraper] Annonce.cz: zpracovávám stránku {page}/{max_pages} ({page_url})",
                 flush=True,
             )
+            rep: dict[str, Any] = {
+                "page": page,
+                "page_url": page_url,
+                "fetch_channel": None,
+                "items_parsed": 0,
+                "html_non_empty": False,
+                "html_char_len": 0,
+                "browser_navigation": None,
+                "empty_streak_after": empty_pages_streak,
+                "outcome": "pending",
+            }
             try:
                 # Listing pages are mostly static HTML, so try direct HTTP first.
                 html = await _fetch_listing_html_http(
                     page_url, listing_page_timeout_ms, referer=prev_url
                 )
-                
-                # Kontrola anti-bot ochrany v HTML
+
                 if html.strip():
+                    rep["fetch_channel"] = "http"
+                    rep["html_non_empty"] = True
+                    rep["html_char_len"] = len(html)
                     _check_for_anti_block(html, page_url)
-                
+
                 if not html.strip():
+                    rep["fetch_channel"] = "browser"
                     result, nav_meta = await _crawl_with_navigation_fallback(
                         crawler=crawler,
                         url=page_url,
@@ -303,17 +350,22 @@ async def discover_anonce_listings(
                         timeout_step_ms=navigation_timeout_step_ms,
                         config_kwargs=config_kwargs,
                     )
+                    rep["browser_navigation"] = _browser_nav_summary(nav_meta)
                     if result is None:
                         attempts = nav_meta.get("attempts", [])
                         last_attempt = attempts[-1] if attempts else {}
-                        raise RuntimeError(
-                            "navigation failed"
-                            f" after {len(attempts)} attempts"
-                            f" (mode={last_attempt.get('wait_until', 'n/a')},"
-                            f" retry={last_attempt.get('retry', 'n/a')},"
-                            f" timeout_ms={last_attempt.get('timeout_ms', 'n/a')}):"
-                            f" {last_attempt.get('error', 'unknown error')}"
+                        err_detail = (
+                            f"after {len(attempts)} attempts "
+                            f"(mode={last_attempt.get('wait_until', 'n/a')}, "
+                            f"retry={last_attempt.get('retry', 'n/a')}, "
+                            f"timeout_ms={last_attempt.get('timeout_ms', 'n/a')}): "
+                            f"{last_attempt.get('error', 'unknown error')}"
                         )
+                        warnings.append(f"anonce: listing navigation failed on page {page}: {err_detail}")
+                        rep["outcome"] = "navigation_failed"
+                        page_reports.append(rep)
+                        await human_delay(min_page_delay_sec, max_page_delay_sec)
+                        continue
                     if nav_meta.get("chosen_mode") != "networkidle":
                         warnings.append(
                             "anonce: listing crawl switched wait mode on page "
@@ -322,14 +374,16 @@ async def discover_anonce_listings(
                             f"{nav_meta.get('chosen_timeout_ms')} ms)."
                         )
                     html = _crawl_result_html(result)
-                    
-                    # Kontrola anti-bot ochrany i pro browser fallback
+                    rep["html_non_empty"] = bool(html.strip())
+                    rep["html_char_len"] = len(html)
                     if html.strip():
                         _check_for_anti_block(html, page_url)
 
                 page_items = parse_anonce_listing_html(html, page_url)
+                rep["items_parsed"] = len(page_items)
                 if not page_items and page > 1:
                     empty_pages_streak += 1
+                    rep["empty_streak_after"] = empty_pages_streak
                     warnings.append(
                         "anonce: no listings on page "
                         f"{page} (empty streak {empty_pages_streak}/"
@@ -340,24 +394,35 @@ async def discover_anonce_listings(
                             "anonce: stopping pagination after "
                             f"{empty_pages_streak} consecutive empty pages."
                         )
+                        rep["outcome"] = "stopped_consecutive_empty_pages"
+                        page_reports.append(rep)
                         break
+                    rep["outcome"] = "empty_page_continue"
+                    page_reports.append(rep)
                     prev_url = page_url
+                    await human_delay(min_page_delay_sec, max_page_delay_sec)
                     continue
                 if not page_items and page == 1:
                     warnings.append(
                         "anonce: page 1 returned no parseable listings (empty HTML or layout change?)."
                     )
+                    rep["outcome"] = "page1_no_listings"
                 if page_items:
                     empty_pages_streak = 0
+                    rep["empty_streak_after"] = 0
                     print(
                         f"[Scraper] Annonce.cz: stránka {page} -> {len(page_items)} inzerátů.",
                         flush=True,
                     )
+                    rep["outcome"] = "ok"
                 listings.extend(page_items)
                 prev_url = page_url
+                page_reports.append(rep)
             except AntiBlockDetected as e:
                 error_msg = str(e)
                 warnings.append(f"ANTI-BOT BLOKACE: {error_msg}")
+                rep["outcome"] = "anti_block"
+                page_reports.append(rep)
                 print(
                     f"\n[Scraper] ⚠️  ANTI-BOT OCHRANA DETEKOVÁNA!\n"
                     f"[Scraper] {error_msg}\n"
@@ -369,9 +434,12 @@ async def discover_anonce_listings(
                 break
             except Exception as exc:  # pragma: no cover - runtime dependent
                 warnings.append(f"anonce: listing crawl failed on page {page}: {exc}")
+                rep["outcome"] = "exception"
+                rep["error"] = str(exc)
+                page_reports.append(rep)
             await human_delay(min_page_delay_sec, max_page_delay_sec)
 
-    return listings, warnings
+    return listings, warnings, page_reports
 
 
 async def extract_job_detail(
@@ -388,7 +456,7 @@ async def extract_job_detail(
     navigation_timeout_step_ms: int = 10000,
     min_detail_delay_sec: float = 2.0,
     max_detail_delay_sec: float = 6.0,
-) -> tuple[dict[str, Any] | None, str | None]:
+) -> tuple[dict[str, Any] | None, str | None, dict[str, Any]]:
     strategy = _detail_extraction_strategy(gemini_model)
     config_kwargs = {
         "extraction_strategy": strategy,
@@ -410,6 +478,15 @@ async def extract_job_detail(
         if result is None:
             attempts = nav_meta.get("attempts", [])
             last_attempt = attempts[-1] if attempts else {}
+            meta = {
+                "detail_url": listing.detail_url,
+                "company": listing.company,
+                "navigation_ok": False,
+                "browser_navigation": _browser_nav_summary(nav_meta),
+                "html_non_empty": False,
+                "html_char_len": 0,
+                "llm_extraction_present": False,
+            }
             return (
                 None,
                 "Detail crawl failed for "
@@ -417,6 +494,7 @@ async def extract_job_detail(
                 f"retry={last_attempt.get('retry', 'n/a')}, "
                 f"timeout_ms={last_attempt.get('timeout_ms', 'n/a')}, "
                 f"error={last_attempt.get('error', 'unknown error')}",
+                meta,
             )
 
         # Kontrola anti-bot ochrany v HTML odpovědi
@@ -424,6 +502,19 @@ async def extract_job_detail(
         _check_for_anti_block(html_content, listing.detail_url)
 
         await reading_pause(1.5, 4.0)
+
+        extracted_raw = getattr(result, "extracted_content", None)
+        llm_extraction_present = bool(extracted_raw)
+
+        meta = {
+            "detail_url": listing.detail_url,
+            "company": listing.company,
+            "navigation_ok": True,
+            "browser_navigation": _browser_nav_summary(nav_meta),
+            "html_non_empty": bool(html_content.strip()),
+            "html_char_len": len(html_content),
+            "llm_extraction_present": llm_extraction_present,
+        }
 
         payload = _parse_extracted_json(result.extracted_content) or {}
         if isinstance(payload, list):
@@ -438,8 +529,21 @@ async def extract_job_detail(
         payload["position"] = payload.get("position") or listing.title
         payload["company"] = payload.get("company") or listing.company
         payload["agency_status"] = agency_status
-        payload["keywords"] = payload.get("keywords") or []
-        return payload, None
+        canonical_role = normalize_job_role_label(payload.get("job_role_label"))
+        detail_hint = listing.detail_url
+        fallback_warning: str | None = None
+        if not canonical_role:
+            canonical_role = JOB_ROLE_OTHER
+            fallback_warning = (
+                f"job_role_label missing or not in allowed list for {detail_hint}; "
+                f"using {JOB_ROLE_OTHER}"
+            )
+        payload["keywords"] = [canonical_role]
+        payload.pop("job_role_label", None)
+        payload["blue_collar_label"] = normalize_blue_collar_label_value(
+            payload.get("blue_collar_label")
+        )
+        return payload, fallback_warning, meta
 
 
 async def deep_crawl_details(
@@ -456,12 +560,13 @@ async def deep_crawl_details(
     min_detail_delay_sec: float = 2.0,
     max_detail_delay_sec: float = 6.0,
     batch_size: int = 2,
-) -> tuple[list[dict[str, Any]], list[str]]:
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     import random
-    
+
     semaphore = asyncio.Semaphore(max(concurrency, 1))
     details: list[dict[str, Any]] = []
     warnings: list[str] = []
+    detail_reports: list[dict[str, Any]] = []
     processed_count = 0
     anti_block_hit = False
     
@@ -482,7 +587,7 @@ async def deep_crawl_details(
                 if anti_block_hit:
                     break
                 try:
-                    payload, warning = await extract_job_detail(
+                    payload, warning, scrape_meta = await extract_job_detail(
                         crawler=crawler,
                         listing=listing,
                         listing_url=listing_url,
@@ -497,16 +602,29 @@ async def deep_crawl_details(
                         min_detail_delay_sec=min_detail_delay_sec,
                         max_detail_delay_sec=max_detail_delay_sec,
                     )
+                    scrape_meta["payload_saved"] = bool(payload)
+                    scrape_meta["extraction_warning"] = warning
+                    detail_reports.append(scrape_meta)
                     if payload:
                         details.append(payload)
                     if warning:
                         warnings.append(warning)
                     processed_count += 1
-                    
+
                 except AntiBlockDetected as e:
                     anti_block_hit = True
                     error_msg = str(e)
                     warnings.append(f"ANTI-BOT BLOKACE: {error_msg}")
+                    detail_reports.append(
+                        {
+                            "detail_url": listing.detail_url,
+                            "company": listing.company,
+                            "navigation_ok": False,
+                            "outcome": "anti_block",
+                            "payload_saved": False,
+                            "error_message": error_msg,
+                        }
+                    )
                     print(
                         f"\n[Scraper] ⚠️  ANTI-BOT OCHRANA DETEKOVÁNA!\n"
                         f"[Scraper] {error_msg}\n"
@@ -531,4 +649,4 @@ async def deep_crawl_details(
                     # Standardní pauza mezi batchy (ale delší než dříve)
                     await human_delay(min_detail_delay_sec * 0.5, max_detail_delay_sec * 0.5)
 
-    return details, warnings
+    return details, warnings, detail_reports

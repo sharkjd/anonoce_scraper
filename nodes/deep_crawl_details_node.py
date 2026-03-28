@@ -1,4 +1,7 @@
+import json
+
 from extractors import deep_crawl_details
+from run_report import append_line, append_section
 from state import ScraperState
 
 
@@ -16,7 +19,7 @@ async def deep_crawl_details_node(state: ScraperState) -> ScraperState:
         flush=True,
     )
 
-    details, warnings = await deep_crawl_details(
+    details, warnings, detail_reports = await deep_crawl_details(
         listings=allowed_listings,
         listing_url=state["listing_base_url"],
         company_classification=state.get("company_classification", {}),
@@ -38,4 +41,13 @@ async def deep_crawl_details_node(state: ScraperState) -> ScraperState:
         f"nových varování: {len(warnings)}.",
         flush=True,
     )
+
+    append_section("Detailní crawl (per URL)")
+    append_line(
+        f"Výpisů celkem: {len(all_listings)}, přeskočeno jako agentura: {skipped}, "
+        f"plánováno detailů: {len(allowed_listings)}, uloženo surových záznamů: {len(details)}, "
+        f"řádků reportu: {len(detail_reports)}"
+    )
+    for row in detail_reports:
+        append_line(json.dumps(row, ensure_ascii=False))
     return state

@@ -32,3 +32,4 @@ class ScraperState(TypedDict, total=False):
     errors: list[str]
     warnings: list[str]
     output_csv_path: str
+    run_log_path: str

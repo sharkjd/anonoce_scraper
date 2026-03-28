@@ -1,5 +1,4 @@
 from .agency_classification_node import agency_classification_node
-from .blue_collar_classification_node import blue_collar_classification_node
 from .dedupe_node import dedupe_listings_node
 from .deep_crawl_details_node import deep_crawl_details_node
 from .discover_anonce_node import discover_anonce_node
@@ -14,6 +13,5 @@ __all__ = [
     "agency_classification_node",
     "deep_crawl_details_node",
     "validate_and_normalize_node",
-    "blue_collar_classification_node",
     "export_csv_node",
 ]
